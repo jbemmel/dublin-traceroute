@@ -10,6 +10,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"sort"
+	"strings"
 	"time"
 
 	flag "github.com/spf13/pflag"
@@ -17,6 +19,7 @@ import (
 	"github.com/insomniacslk/dublin-traceroute/go/dublintraceroute"
 	"github.com/insomniacslk/dublin-traceroute/go/dublintraceroute/probes/probev4"
 	"github.com/insomniacslk/dublin-traceroute/go/dublintraceroute/probes/probev6"
+	"github.com/insomniacslk/dublin-traceroute/go/dublintraceroute/results"
 )
 
 // Program constants and default values
@@ -50,6 +53,77 @@ type args struct {
 	outputFile   string
 	outputFormat string
 	v4           bool
+}
+
+func resolveTargets(value string, wantV6 bool) ([]net.IP, error) {
+	parts := strings.Split(value, ",")
+	targets := make([]net.IP, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		host := strings.TrimSpace(part)
+		if host == "" {
+			return nil, errors.New("target list contains an empty target")
+		}
+		ip, err := resolve(host, wantV6)
+		if err != nil {
+			return nil, fmt.Errorf("cannot resolve %s: %w", host, err)
+		}
+		key := ip.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		targets = append(targets, ip)
+	}
+	return targets, nil
+}
+
+// branchTTL returns the first TTL at which the reference target answered. All
+// earlier probes form the prefix that can be shared with the other targets.
+func branchTTL(r *results.Results, fallback uint8) uint8 {
+	branch := fallback
+	for _, flow := range r.Flows {
+		for _, probe := range flow {
+			if probe.IsLast && probe.Sent.IP.TTL < branch {
+				branch = probe.Sent.IP.TTL
+				break
+			}
+		}
+	}
+	return branch
+}
+
+func mergeTargetResults(dst, src *results.Results, branch uint8) error {
+	ids := make([]int, 0, len(src.Flows))
+	for id := range src.Flows {
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+
+	next := 0
+	for id := range dst.Flows {
+		if int(id) >= next {
+			next = int(id) + 1
+		}
+	}
+	for _, rawID := range ids {
+		if next > 0xffff {
+			return errors.New("too many target paths to represent in the result")
+		}
+		id := uint16(rawID)
+		flow := make([]results.Probe, 0, len(dst.Flows[id])+len(src.Flows[id]))
+		for _, probe := range dst.Flows[id] {
+			if probe.Sent.IP.TTL >= branch {
+				break
+			}
+			probe.IsLast = false
+			flow = append(flow, probe)
+		}
+		flow = append(flow, src.Flows[id]...)
+		dst.Flows[uint16(next)] = flow
+		next++
+	}
+	return nil
 }
 
 // Args will hold the program arguments
@@ -101,7 +175,7 @@ func init() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Dublin Traceroute (Go implementation) %s\n", ProgramVersion)
 		fmt.Fprintf(os.Stderr, "Written by %s - %s\n", ProgramAuthorName, ProgramAuthorInfo)
-		fmt.Fprintf(os.Stderr, "\n")
+		fmt.Fprintf(os.Stderr, "\nUsage: dublin-traceroute [options] <target>[,<target>...]\n\n")
 		flag.PrintDefaults()
 	}
 	// Args holds the program's arguments as parsed by `flag`
@@ -136,16 +210,16 @@ func main() {
 	}
 
 	if len(flag.Args()) != 1 {
-		log.Fatal("Exactly one target is required")
+		log.Fatal("Exactly one target argument is required (use commas for multiple targets)")
 	}
 
 	Args.target = flag.Arg(0)
-	target, err := resolve(Args.target, !Args.v4)
+	targets, err := resolveTargets(Args.target, !Args.v4)
 	if err != nil {
-		log.Fatalf("Cannot resolve %s: %v", flag.Arg(0), err)
+		log.Fatal(err)
 	}
 	fmt.Fprintf(os.Stderr, "Traceroute configuration:\n")
-	fmt.Fprintf(os.Stderr, "Target                : %v\n", target)
+	fmt.Fprintf(os.Stderr, "Targets               : %v\n", targets)
 	fmt.Fprintf(os.Stderr, "Base source port      : %v\n", Args.sport)
 	fmt.Fprintf(os.Stderr, "Base destination port : %v\n", Args.dport)
 	fmt.Fprintf(os.Stderr, "Use srcport for paths : %v\n", Args.useSrcport)
@@ -156,46 +230,59 @@ func main() {
 	fmt.Fprintf(os.Stderr, "Timeout               : %v\n", time.Duration(Args.delay)*time.Millisecond)
 	fmt.Fprintf(os.Stderr, "Treat as broken NAT   : %v\n", Args.brokenNAT)
 
-	var dt dublintraceroute.DublinTraceroute
-	if Args.v4 {
-		dt = &probev4.UDPv4{
-			Target:     target,
-			SrcPort:    uint16(Args.sport),
-			DstPort:    uint16(Args.dport),
-			UseSrcPort: Args.useSrcport,
-			NumPaths:   uint16(Args.npaths),
-			MinTTL:     uint8(Args.minTTL),
-			MaxTTL:     uint8(Args.maxTTL),
-			Delay:      time.Duration(Args.delay) * time.Millisecond,
-			Timeout:    DefaultReadTimeout,
-			BrokenNAT:  Args.brokenNAT,
+	newTraceroute := func(target net.IP, minTTL, maxTTL uint8) dublintraceroute.DublinTraceroute {
+		if Args.v4 {
+			return &probev4.UDPv4{
+				Target:     target,
+				SrcPort:    uint16(Args.sport),
+				DstPort:    uint16(Args.dport),
+				UseSrcPort: Args.useSrcport,
+				NumPaths:   uint16(Args.npaths),
+				MinTTL:     minTTL,
+				MaxTTL:     maxTTL,
+				Delay:      time.Duration(Args.delay) * time.Millisecond,
+				Timeout:    DefaultReadTimeout,
+				BrokenNAT:  Args.brokenNAT,
+			}
 		}
-	} else {
-		dt = &probev6.UDPv6{
+		return &probev6.UDPv6{
 			Target:      target,
 			SrcPort:     uint16(Args.sport),
 			DstPort:     uint16(Args.dport),
 			UseSrcPort:  Args.useSrcport,
 			NumPaths:    uint16(Args.npaths),
-			MinHopLimit: uint8(Args.minTTL),
-			MaxHopLimit: uint8(Args.maxTTL),
+			MinHopLimit: minTTL,
+			MaxHopLimit: maxTTL,
 			Delay:       time.Duration(Args.delay) * time.Millisecond,
 			Timeout:     DefaultReadTimeout,
 			BrokenNAT:   Args.brokenNAT,
 		}
 	}
-	results, err := dt.Traceroute()
+	traceResults, err := newTraceroute(targets[0], uint8(Args.minTTL), uint8(Args.maxTTL)).Traceroute()
 	if err != nil {
 		log.Fatalf("Traceroute() failed: %v", err)
+	}
+	if len(targets) > 1 {
+		branch := branchTTL(traceResults, uint8(Args.maxTTL))
+		fmt.Fprintf(os.Stderr, "Target fan-out TTL    : %v\n", branch)
+		for _, target := range targets[1:] {
+			targetResults, traceErr := newTraceroute(target, branch, branch).Traceroute()
+			if traceErr != nil {
+				log.Fatalf("Traceroute() to %s failed: %v", target, traceErr)
+			}
+			if err := mergeTargetResults(traceResults, targetResults, branch); err != nil {
+				log.Fatalf("Cannot merge results for %s: %v", target, err)
+			}
+		}
 	}
 	var (
 		output string
 	)
 	switch Args.outputFormat {
 	case "json":
-		output, err = results.ToJSON(true, "  ")
+		output, err = traceResults.ToJSON(true, "  ")
 	case "dot":
-		output, err = results.ToDOT()
+		output, err = traceResults.ToDOT()
 	default:
 		log.Fatalf("Unknown output format \"%s\"", Args.outputFormat)
 	}

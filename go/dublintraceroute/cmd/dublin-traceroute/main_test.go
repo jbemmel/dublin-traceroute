@@ -31,33 +31,27 @@ func TestResolveTargetsRejectsEmptyEntry(t *testing.T) {
 	require.EqualError(t, err, "target list contains an empty target")
 }
 
-func TestBranchTTL(t *testing.T) {
-	r := &results.Results{Flows: map[uint16][]results.Probe{
-		33434: {testProbe("192.0.2.1", 1, false), testProbe("192.0.2.1", 4, true)},
-		33435: {testProbe("192.0.2.1", 1, false), testProbe("192.0.2.1", 5, true)},
-	}}
-	require.Equal(t, uint8(4), branchTTL(r, 30))
-}
-
-func TestMergeTargetResultsSharesPrefix(t *testing.T) {
-	primary := &results.Results{Flows: map[uint16][]results.Probe{
-		33434: {
-			testProbe("192.0.2.1", 1, false),
-			testProbe("192.0.2.1", 2, false),
-			testProbe("192.0.2.1", 3, true),
-		},
-	}}
-	secondary := &results.Results{Flows: map[uint16][]results.Probe{
-		33434: {testProbe("192.0.2.2", 3, true)},
-	}}
-
-	require.NoError(t, mergeTargetResults(primary, secondary, 3))
-	require.Len(t, primary.Flows, 2)
-	merged := primary.Flows[33435]
-	require.Len(t, merged, 3)
-	require.Equal(t, uint8(1), merged[0].Sent.IP.TTL)
-	require.Equal(t, "192.0.2.1", merged[0].Sent.IP.DstIP.String())
-	require.Equal(t, uint8(3), merged[2].Sent.IP.TTL)
-	require.Equal(t, "192.0.2.2", merged[2].Sent.IP.DstIP.String())
-	require.True(t, merged[2].IsLast)
+func TestMergeTargetResultsKeepsPathsIndependent(t *testing.T) {
+	primaryFlow := []results.Probe{
+		testProbe("192.0.2.1", 1, false),
+		testProbe("192.0.2.1", 2, false),
+		testProbe("192.0.2.1", 3, true),
+	}
+	primary := &results.Results{Flows: map[uint16][]results.Probe{33434: primaryFlow}}
+	// Reuse the same flow ID across three destinations with different path lengths.
+	for i, target := range []string{"192.0.2.2", "192.0.2.3"} {
+		flow := []results.Probe{
+			testProbe(target, 1, false),
+			testProbe(target, 2, i == 0),
+		}
+		if i == 1 {
+			flow = append(flow, testProbe(target, 3, false), testProbe(target, 4, true))
+		}
+		secondary := &results.Results{Flows: map[uint16][]results.Probe{33434: flow}}
+		require.NoError(t, mergeTargetResults(primary, secondary))
+		require.Equal(t, flow, primary.Flows[uint16(33435+i)])
+		require.Equal(t, flow, secondary.Flows[33434])
+	}
+	require.Len(t, primary.Flows, 3)
+	require.Equal(t, primaryFlow, primary.Flows[33434])
 }

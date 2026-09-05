@@ -78,22 +78,8 @@ func resolveTargets(value string, wantV6 bool) ([]net.IP, error) {
 	return targets, nil
 }
 
-// branchTTL returns the first TTL at which the reference target answered. All
-// earlier probes form the prefix that can be shared with the other targets.
-func branchTTL(r *results.Results, fallback uint8) uint8 {
-	branch := fallback
-	for _, flow := range r.Flows {
-		for _, probe := range flow {
-			if probe.IsLast && probe.Sent.IP.TTL < branch {
-				branch = probe.Sent.IP.TTL
-				break
-			}
-		}
-	}
-	return branch
-}
-
-func mergeTargetResults(dst, src *results.Results, branch uint8) error {
+// mergeTargetResults adds independent target paths under unique flow IDs.
+func mergeTargetResults(dst, src *results.Results) error {
 	ids := make([]int, 0, len(src.Flows))
 	for id := range src.Flows {
 		ids = append(ids, int(id))
@@ -111,16 +97,7 @@ func mergeTargetResults(dst, src *results.Results, branch uint8) error {
 			return errors.New("too many target paths to represent in the result")
 		}
 		id := uint16(rawID)
-		flow := make([]results.Probe, 0, len(dst.Flows[id])+len(src.Flows[id]))
-		for _, probe := range dst.Flows[id] {
-			if probe.Sent.IP.TTL >= branch {
-				break
-			}
-			probe.IsLast = false
-			flow = append(flow, probe)
-		}
-		flow = append(flow, src.Flows[id]...)
-		dst.Flows[uint16(next)] = flow
+		dst.Flows[uint16(next)] = append([]results.Probe(nil), src.Flows[id]...)
 		next++
 	}
 	return nil
@@ -263,14 +240,12 @@ func main() {
 		log.Fatalf("Traceroute() failed: %v", err)
 	}
 	if len(targets) > 1 {
-		branch := branchTTL(traceResults, uint8(Args.maxTTL))
-		fmt.Fprintf(os.Stderr, "Target fan-out TTL    : %v\n", branch)
 		for _, target := range targets[1:] {
-			targetResults, traceErr := newTraceroute(target, branch, branch).Traceroute()
+			targetResults, traceErr := newTraceroute(target, uint8(Args.minTTL), uint8(Args.maxTTL)).Traceroute()
 			if traceErr != nil {
 				log.Fatalf("Traceroute() to %s failed: %v", target, traceErr)
 			}
-			if err := mergeTargetResults(traceResults, targetResults, branch); err != nil {
+			if err := mergeTargetResults(traceResults, targetResults); err != nil {
 				log.Fatalf("Cannot merge results for %s: %v", target, err)
 			}
 		}

@@ -68,18 +68,16 @@ jobs:
           go-version: ${{ matrix.go }}
       - run: |
           echo "GOPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
-      - if: matrix.os != 'windows-latest'
+      - name: Build Go binary with version metadata
+        shell: bash
         run: |
           cd src/github.com/${{ github.repository }}/go/dublintraceroute/cmd/dublin-traceroute
-          go get -v ./...
-          go build
-          ./dublin-traceroute --version
-      - if: matrix.os == 'windows-latest'
-        run: |
-          cd src/github.com/${{ github.repository }}/go/dublintraceroute/cmd/dublin-traceroute
-          go get -v ./...
-          go build
-          .\dublin-traceroute.exe --version
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          git_commit=$(git rev-parse HEAD)
+          go build -ldflags "-X main.BuildDate=$build_date -X main.GitCommit=$git_commit"
+          version=$(./dublin-traceroute --version)
+          echo "$version"
+          [[ "$version" == *"built $build_date, git $git_commit"* ]]
   test_go:
     runs-on: ${{ matrix.os }}
     strategy:

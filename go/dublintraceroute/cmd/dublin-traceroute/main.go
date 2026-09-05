@@ -25,7 +25,6 @@ import (
 // Program constants and default values
 const (
 	ProgramName         = "Dublin Traceroute"
-	ProgramVersion      = "v0.2+exergy"
 	ProgramAuthorName   = "Andrea Barberio"
 	ProgramAuthorInfo   = "https://insomniac.slackware.it"
 	DefaultSourcePort   = 12345
@@ -36,6 +35,13 @@ const (
 	DefaultDelay        = 50 //msec
 	DefaultReadTimeout  = 3 * time.Second
 	DefaultOutputFormat = "json"
+)
+
+// BuildDate and GitCommit are injected by the Go build workflow using -ldflags.
+var (
+	BuildDate      = "unknown"
+	GitCommit      = "unknown"
+	ProgramVersion = "v0.2+exergy (built " + BuildDate + ", git " + GitCommit + ")"
 )
 
 // used to hold flags
